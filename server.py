@@ -1,8 +1,6 @@
 import json
 import os
 import re
-import sys
-import threading
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -12,8 +10,8 @@ from pathlib import Path
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "10000"))
 ROOT = Path(__file__).resolve().parent
+BASE = "https://treasurehymns.com"
 
-state_lock = threading.Lock()
 state = {
     "hymn": None,
     "section": None,
@@ -29,7 +27,6 @@ state = {
     },
 }
 
-BASE = "https://treasurehymns.com"
 
 class PageParser(HTMLParser):
     def __init__(self):
@@ -40,15 +37,16 @@ class PageParser(HTMLParser):
         self._in_title = False
         self.title = ""
         self.block_tags = {
-            "p","div","br","li","ul","ol","h1","h2","h3","h4","h5","h6",
-            "article","section","header","footer","main","aside","blockquote",
-            "tr","td","th","pre"
+            "p", "div", "br", "li", "ul", "ol",
+            "h1", "h2", "h3", "h4", "h5", "h6",
+            "article", "section", "header", "footer",
+            "main", "aside", "blockquote", "tr", "td", "th", "pre"
         }
 
     def _flush(self):
-        s = "".join(self._buf).strip()
-        if s:
-            self.lines.append(re.sub(r"\s+", " ", s))
+        text = "".join(self._buf).strip()
+        if text:
+            self.lines.append(re.sub(r"\s+", " ", text))
         self._buf = []
 
     def handle_starttag(self, tag, attrs):
@@ -57,8 +55,7 @@ class PageParser(HTMLParser):
         if tag == "title":
             self._in_title = True
         if tag == "a":
-            d = dict(attrs)
-            href = d.get("href")
+            href = dict(attrs).get("href")
             if href:
                 self.hrefs.append(href)
 
@@ -79,16 +76,19 @@ class PageParser(HTMLParser):
 
 
 def fetch(url):
-    req = urllib.request.Request(
+    request = urllib.request.Request(
         url,
         headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/131 Safari/537.36 HymnDock/1.0"
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/131 Safari/537.36 HymnDock/1.1"
+            )
         },
     )
-    with urllib.request.urlopen(req, timeout=20) as r:
-        raw = r.read()
-        charset = r.headers.get_content_charset() or "utf-8"
+    with urllib.request.urlopen(request, timeout=20) as response:
+        raw = response.read()
+        charset = response.headers.get_content_charset() or "utf-8"
         return raw.decode(charset, errors="replace")
 
 
@@ -103,131 +103,192 @@ def find_hymn_url(number):
         f"{BASE}/yor/?s=hymn+{urllib.parse.quote_plus(number)}",
         f"{BASE}/yor/youruba-iwe-orin-mimo-anglican-hymnbook/?s=hymn+{urllib.parse.quote_plus(number)}",
     ]
-    pattern = re.compile(rf"/yor/[^\"']*/hymn-{re.escape(number)}-[^\"']+-lyrics/?$", re.I)
+
+    strict = re.compile(
+        rf"/yor/[^\"']*/hymn-{re.escape(number)}-[^\"']+-lyrics/?$",
+        re.I,
+    )
 
     for search_url in queries:
         try:
             html = fetch(search_url)
-            p = PageParser()
-            p.feed(html)
-            candidates = [clean_url(h) for h in p.hrefs]
+            parser = PageParser()
+            parser.feed(html)
+            candidates = [clean_url(href) for href in parser.hrefs]
+
             for url in candidates:
                 path = urllib.parse.urlparse(url).path.rstrip("/") + "/"
-                if pattern.search(path):
+                if strict.search(path):
                     return url
-            # Less strict fallback: same hymn number and lyrics in Yoruba area.
+
             for url in candidates:
                 path = urllib.parse.urlparse(url).path.lower()
                 if f"/hymn-{number}-" in path and "lyrics" in path and "/yor/" in path:
                     return url
         except Exception:
             continue
+
     return None
+
+
+STOP_LINES = re.compile(
+    r"^(Previous:|Next:|Your email address|Comment|Name|Email|Website|"
+    r"Search$|Hymns You May Like|Archives|Categories|Share|Related Posts)",
+    re.I,
+)
+
+# Supports: "1 Text", "1. Text", "1) Text", and "1 - Text".
+NUMBERED_STANZA = re.compile(r"^(\d{1,2})(?:[.)]|\\s+-\\s+|\\s+)(.*)$")
+
+
+def parse_numbered_stanzas(lines):
+    stanzas = []
+    current = None
+
+    for line in lines:
+        if STOP_LINES.match(line):
+            if current:
+                stanzas.append(current)
+            break
+
+        match = NUMBERED_STANZA.match(line)
+        if match:
+            if current:
+                stanzas.append(current)
+            number = int(match.group(1))
+            first_line = match.group(2).strip()
+            # Avoid treating a bare navigation number as a hymn stanza.
+            if not first_line:
+                current = None
+                continue
+            current = {"number": number, "lines": [first_line]}
+        elif current:
+            current["lines"].append(line)
+
+    if current:
+        stanzas.append(current)
+
+    return stanzas
 
 
 def parse_hymn(url):
     html = fetch(url)
-    p = PageParser()
-    p.feed(html)
-    lines = [x.strip() for x in p.lines if x.strip()]
+    parser = PageParser()
+    parser.feed(html)
+    lines = [line.strip() for line in parser.lines if line.strip()]
 
-    # Remove common site-navigation noise before the hymn body.
+    # Find a useful hymn title.
     title = ""
-    for line in lines:
+    title_index = -1
+
+    for i, line in enumerate(lines):
         if re.match(r"^Hymn\s+\d+\b", line, re.I):
             title = line
+            title_index = i
             break
+
     if not title:
-        m = re.search(r"Hymn\s+\d+\b[^<\n]*", p.title, re.I)
-        title = m.group(0).strip() if m else "Hymn"
+        match = re.search(r"Hymn\s+\d+\b[^<\n]*", parser.title, re.I)
+        title = match.group(0).strip() if match else "Hymn"
 
-    start = None
-    for i, line in enumerate(lines):
-        if re.fullmatch(r"APA\s+I", line, re.I):
-            start = i
-            break
-    if start is None:
-        raise ValueError("Could not find the hymn's APA I section on the page.")
+    hymn_number_match = re.search(r"Hymn\s+(\d+)", title, re.I)
+    hymn_number = int(hymn_number_match.group(1)) if hymn_number_match else None
 
-    body = lines[start:]
+    # First try the existing APA-style structure.
     sections = {}
     current_section = None
     current_stanza = None
+    body = lines[max(title_index + 1, 0):]
 
     for line in body:
-        sec = re.fullmatch(r"APA\s+(.+)", line, re.I)
-        if sec:
+        section_match = re.fullmatch(r"APA\s+(.+)", line, re.I)
+        if section_match:
             current_section = line.upper()
             sections.setdefault(current_section, [])
             current_stanza = None
             continue
 
-        # Stop when the actual hymn is over.
-        if current_section and re.match(
-            r"^(Previous:|Next:|Your email address|Comment|Name|Email|Website|Search$|Hymns You May Like|Archives|Categories)",
-            line, re.I
-        ):
+        if current_section and STOP_LINES.match(line):
             break
 
-        m = re.match(r"^(\d{1,2})\s+(.*)$", line)
-        if m and current_section:
+        match = NUMBERED_STANZA.match(line)
+        if match and current_section:
             current_stanza = {
-                "number": int(m.group(1)),
-                "lines": [m.group(2).strip()],
+                "number": int(match.group(1)),
+                "lines": [match.group(2).strip()],
             }
             sections[current_section].append(current_stanza)
         elif current_section and current_stanza:
             current_stanza["lines"].append(line)
 
-    # Keep only sections that actually contain stanzas.
-    sections = {k: v for k, v in sections.items() if v}
+    sections = {name: verses for name, verses in sections.items() if verses}
+
+    # NEW: many Treasure Hymns pages have no APA headings.
+    # In that case, treat the numbered hymn verses as one section called "Hymn".
     if not sections:
-        raise ValueError("No hymn verses were detected on the page.")
+        numbered_lines = body
 
-    # Find previous/next hymn links.
-    previous = next_ = None
-    for href in p.hrefs:
-        full = clean_url(href)
-        if not previous and re.search(r"/hymn-\d+-", full, re.I):
-            if "previous" in href.lower():
-                previous = full
-        if not next_ and re.search(r"/hymn-\d+-", full, re.I):
-            if "next" in href.lower():
-                next_ = full
+        # Remove common navigation/header noise before looking for verse 1.
+        # We start at the first plausible numbered stanza.
+        first_stanza_index = None
+        for i, line in enumerate(numbered_lines):
+            match = NUMBERED_STANZA.match(line)
+            if match and match.group(2).strip():
+                if int(match.group(1)) == 1:
+                    first_stanza_index = i
+                    break
 
-    # More reliable previous/next extraction from visible lines is handled below
-    # by scanning the HTML for link text.
+        if first_stanza_index is not None:
+            fallback = parse_numbered_stanzas(numbered_lines[first_stanza_index:])
+            if fallback:
+                sections["Hymn"] = fallback
+
+    if not sections:
+        raise ValueError(
+            "Could not detect hymn verses on the page. "
+            "Try pasting the full Treasure Hymns hymn URL."
+        )
+
+    # Previous / Next hymn links.
+    previous = None
+    next_url = None
+
     class LinkTextParser(HTMLParser):
         def __init__(self):
             super().__init__(convert_charrefs=True)
             self.current = None
             self.links = []
+
         def handle_starttag(self, tag, attrs):
             if tag == "a":
-                self.current = {"href": dict(attrs).get("href"), "text": []}
+                self.current = {
+                    "href": dict(attrs).get("href"),
+                    "text": [],
+                }
+
         def handle_endtag(self, tag):
             if tag == "a" and self.current:
                 self.links.append(self.current)
                 self.current = None
+
         def handle_data(self, data):
             if self.current:
                 self.current["text"].append(data)
 
-    lp = LinkTextParser()
-    lp.feed(html)
-    for link in lp.links:
-        text = " ".join(link["text"]).strip()
-        if not link.get("href"):
-            continue
-        full = clean_url(link["href"])
-        if re.match(r"Previous:", text, re.I):
-            previous = full
-        elif re.match(r"Next:", text, re.I):
-            next_ = full
+    link_parser = LinkTextParser()
+    link_parser.feed(html)
 
-    # Extract the hymn number from the title.
-    nm = re.search(r"Hymn\s+(\d+)", title, re.I)
-    hymn_number = int(nm.group(1)) if nm else None
+    for link in link_parser.links:
+        href = link.get("href")
+        if not href:
+            continue
+        text = " ".join(link["text"]).strip()
+        full_url = clean_url(href)
+
+        if re.match(r"Previous:", text, re.I):
+            previous = full_url
+        elif re.match(r"Next:", text, re.I):
+            next_url = full_url
 
     return {
         "number": hymn_number,
@@ -235,7 +296,7 @@ def parse_hymn(url):
         "url": url,
         "sections": sections,
         "previous": previous,
-        "next": next_,
+        "next": next_url,
     }
 
 
@@ -265,42 +326,46 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
-        qs = urllib.parse.parse_qs(parsed.query)
+        query = urllib.parse.parse_qs(parsed.query)
 
         if path == "/api/hymn":
             try:
-                if "url" in qs:
-                    url = qs["url"][0]
+                if "url" in query:
+                    url = query["url"][0]
                     if not url.startswith(BASE + "/"):
                         raise ValueError("Only Treasure Hymns URLs are supported.")
-                elif "number" in qs:
-                    url = find_hymn_url(qs["number"][0])
+                elif "number" in query:
+                    url = find_hymn_url(query["number"][0])
                     if not url:
-                        raise ValueError(f"Could not find Hymn {qs['number'][0]} on Treasure Hymns.")
+                        raise ValueError(
+                            f"Could not find Hymn {query['number'][0]} on Treasure Hymns."
+                        )
                 else:
                     raise ValueError("Provide a hymn number or URL.")
+
                 hymn = parse_hymn(url)
                 json_response(self, {"ok": True, "hymn": hymn})
-            except Exception as e:
-                json_response(self, {"ok": False, "error": str(e)}, 400)
+            except Exception as exc:
+                json_response(self, {"ok": False, "error": str(exc)}, 400)
             return
 
         if path == "/api/state":
-            with state_lock:
-                payload = dict(state)
-            json_response(self, {"ok": True, "state": payload})
+            json_response(self, {"ok": True, "state": state})
             return
 
         if path in ("/", "/dock"):
             filename = "dock.html"
         elif path == "/display":
             filename = "display.html"
+        elif path in ("/display_bottom", "/display-bottom"):
+            filename = "display_bottom.html"
         else:
-            # Serve static files in this folder.
             filename = path.lstrip("/") or "dock.html"
 
         target = (ROOT / filename).resolve()
-        if not str(target).startswith(str(ROOT.resolve())) or not target.is_file():
+        root = ROOT.resolve()
+
+        if not str(target).startswith(str(root)) or not target.is_file():
             self.send_error(404)
             return
 
@@ -310,6 +375,7 @@ class Handler(BaseHTTPRequestHandler):
             ".js": "application/javascript; charset=utf-8",
             ".json": "application/json; charset=utf-8",
         }.get(target.suffix.lower(), "application/octet-stream")
+
         data = target.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -320,36 +386,41 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+
         if parsed.path != "/api/state":
             self.send_error(404)
             return
+
         try:
-            n = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(n)
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
             incoming = json.loads(body.decode("utf-8"))
-            with state_lock:
-                if "hymn" in incoming:
-                    state["hymn"] = incoming["hymn"]
-                if "section" in incoming:
-                    state["section"] = incoming["section"]
-                if "stanza" in incoming:
-                    state["stanza"] = incoming["stanza"]
-                if "settings" in incoming:
-                    state["settings"].update(incoming["settings"])
+
+            if "hymn" in incoming:
+                state["hymn"] = incoming["hymn"]
+            if "section" in incoming:
+                state["section"] = incoming["section"]
+            if "stanza" in incoming:
+                state["stanza"] = incoming["stanza"]
+            if "settings" in incoming:
+                state["settings"].update(incoming["settings"])
+
             json_response(self, {"ok": True, "state": state})
-        except Exception as e:
-            json_response(self, {"ok": False, "error": str(e)}, 400)
+        except Exception as exc:
+            json_response(self, {"ok": False, "error": str(exc)}, 400)
 
 
 def main():
     print("=" * 60)
     print("Hymn Dock for OBS")
-    print(f"Dock:    http://{HOST}:{PORT}/dock")
-    print(f"Display: http://{HOST}:{PORT}/display")
-    print("Keep this window running while using the dock.")
-    print("Press Ctrl+C to stop.")
+    print(f"Listening on {HOST}:{PORT}")
+    print(f"Dock:          /dock")
+    print(f"Transparent:   /display")
+    print(f"Bottom style:  /display_bottom")
     print("=" * 60)
+
     server = ThreadingHTTPServer((HOST, PORT), Handler)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
