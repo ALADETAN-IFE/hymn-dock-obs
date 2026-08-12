@@ -1,0 +1,362 @@
+import json
+import os
+import re
+import sys
+import threading
+import urllib.parse
+import urllib.request
+from html.parser import HTMLParser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", "10000"))
+ROOT = Path(__file__).resolve().parent
+
+state_lock = threading.Lock()
+state = {
+    "hymn": None,
+    "section": None,
+    "stanza": None,
+    "settings": {
+        "show_title": True,
+        "show_hymn_number": True,
+        "show_section": False,
+        "font_size": 58,
+        "max_width": 1500,
+        "line_height": 1.35,
+        "text_align": "center",
+    },
+}
+
+BASE = "https://treasurehymns.com"
+
+class PageParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.lines = []
+        self.hrefs = []
+        self._buf = []
+        self._in_title = False
+        self.title = ""
+        self.block_tags = {
+            "p","div","br","li","ul","ol","h1","h2","h3","h4","h5","h6",
+            "article","section","header","footer","main","aside","blockquote",
+            "tr","td","th","pre"
+        }
+
+    def _flush(self):
+        s = "".join(self._buf).strip()
+        if s:
+            self.lines.append(re.sub(r"\s+", " ", s))
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.block_tags:
+            self._flush()
+        if tag == "title":
+            self._in_title = True
+        if tag == "a":
+            d = dict(attrs)
+            href = d.get("href")
+            if href:
+                self.hrefs.append(href)
+
+    def handle_endtag(self, tag):
+        if tag in self.block_tags:
+            self._flush()
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self.title += data
+        self._buf.append(data)
+
+    def close(self):
+        super().close()
+        self._flush()
+
+
+def fetch(url):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) Chrome/131 Safari/537.36 HymnDock/1.0"
+        },
+    )
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read()
+        charset = r.headers.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="replace")
+
+
+def clean_url(href):
+    return urllib.parse.urljoin(BASE, href)
+
+
+def find_hymn_url(number):
+    number = str(int(number))
+    queries = [
+        f"{BASE}/?s=hymn+{urllib.parse.quote_plus(number)}",
+        f"{BASE}/yor/?s=hymn+{urllib.parse.quote_plus(number)}",
+        f"{BASE}/yor/youruba-iwe-orin-mimo-anglican-hymnbook/?s=hymn+{urllib.parse.quote_plus(number)}",
+    ]
+    pattern = re.compile(rf"/yor/[^\"']*/hymn-{re.escape(number)}-[^\"']+-lyrics/?$", re.I)
+
+    for search_url in queries:
+        try:
+            html = fetch(search_url)
+            p = PageParser()
+            p.feed(html)
+            candidates = [clean_url(h) for h in p.hrefs]
+            for url in candidates:
+                path = urllib.parse.urlparse(url).path.rstrip("/") + "/"
+                if pattern.search(path):
+                    return url
+            # Less strict fallback: same hymn number and lyrics in Yoruba area.
+            for url in candidates:
+                path = urllib.parse.urlparse(url).path.lower()
+                if f"/hymn-{number}-" in path and "lyrics" in path and "/yor/" in path:
+                    return url
+        except Exception:
+            continue
+    return None
+
+
+def parse_hymn(url):
+    html = fetch(url)
+    p = PageParser()
+    p.feed(html)
+    lines = [x.strip() for x in p.lines if x.strip()]
+
+    # Remove common site-navigation noise before the hymn body.
+    title = ""
+    for line in lines:
+        if re.match(r"^Hymn\s+\d+\b", line, re.I):
+            title = line
+            break
+    if not title:
+        m = re.search(r"Hymn\s+\d+\b[^<\n]*", p.title, re.I)
+        title = m.group(0).strip() if m else "Hymn"
+
+    start = None
+    for i, line in enumerate(lines):
+        if re.fullmatch(r"APA\s+I", line, re.I):
+            start = i
+            break
+    if start is None:
+        raise ValueError("Could not find the hymn's APA I section on the page.")
+
+    body = lines[start:]
+    sections = {}
+    current_section = None
+    current_stanza = None
+
+    for line in body:
+        sec = re.fullmatch(r"APA\s+(.+)", line, re.I)
+        if sec:
+            current_section = line.upper()
+            sections.setdefault(current_section, [])
+            current_stanza = None
+            continue
+
+        # Stop when the actual hymn is over.
+        if current_section and re.match(
+            r"^(Previous:|Next:|Your email address|Comment|Name|Email|Website|Search$|Hymns You May Like|Archives|Categories)",
+            line, re.I
+        ):
+            break
+
+        m = re.match(r"^(\d{1,2})\s+(.*)$", line)
+        if m and current_section:
+            current_stanza = {
+                "number": int(m.group(1)),
+                "lines": [m.group(2).strip()],
+            }
+            sections[current_section].append(current_stanza)
+        elif current_section and current_stanza:
+            current_stanza["lines"].append(line)
+
+    # Keep only sections that actually contain stanzas.
+    sections = {k: v for k, v in sections.items() if v}
+    if not sections:
+        raise ValueError("No hymn verses were detected on the page.")
+
+    # Find previous/next hymn links.
+    previous = next_ = None
+    for href in p.hrefs:
+        full = clean_url(href)
+        if not previous and re.search(r"/hymn-\d+-", full, re.I):
+            if "previous" in href.lower():
+                previous = full
+        if not next_ and re.search(r"/hymn-\d+-", full, re.I):
+            if "next" in href.lower():
+                next_ = full
+
+    # More reliable previous/next extraction from visible lines is handled below
+    # by scanning the HTML for link text.
+    class LinkTextParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.current = None
+            self.links = []
+        def handle_starttag(self, tag, attrs):
+            if tag == "a":
+                self.current = {"href": dict(attrs).get("href"), "text": []}
+        def handle_endtag(self, tag):
+            if tag == "a" and self.current:
+                self.links.append(self.current)
+                self.current = None
+        def handle_data(self, data):
+            if self.current:
+                self.current["text"].append(data)
+
+    lp = LinkTextParser()
+    lp.feed(html)
+    for link in lp.links:
+        text = " ".join(link["text"]).strip()
+        if not link.get("href"):
+            continue
+        full = clean_url(link["href"])
+        if re.match(r"Previous:", text, re.I):
+            previous = full
+        elif re.match(r"Next:", text, re.I):
+            next_ = full
+
+    # Extract the hymn number from the title.
+    nm = re.search(r"Hymn\s+(\d+)", title, re.I)
+    hymn_number = int(nm.group(1)) if nm else None
+
+    return {
+        "number": hymn_number,
+        "title": title,
+        "url": url,
+        "sections": sections,
+        "previous": previous,
+        "next": next_,
+    }
+
+
+def json_response(handler, payload, status=200):
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Headers", "Content-Type")
+    handler.send_header("Content-Length", str(len(data)))
+    handler.end_headers()
+    handler.wfile.write(data)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        print(fmt % args)
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        qs = urllib.parse.parse_qs(parsed.query)
+
+        if path == "/api/hymn":
+            try:
+                if "url" in qs:
+                    url = qs["url"][0]
+                    if not url.startswith(BASE + "/"):
+                        raise ValueError("Only Treasure Hymns URLs are supported.")
+                elif "number" in qs:
+                    url = find_hymn_url(qs["number"][0])
+                    if not url:
+                        raise ValueError(f"Could not find Hymn {qs['number'][0]} on Treasure Hymns.")
+                else:
+                    raise ValueError("Provide a hymn number or URL.")
+                hymn = parse_hymn(url)
+                json_response(self, {"ok": True, "hymn": hymn})
+            except Exception as e:
+                json_response(self, {"ok": False, "error": str(e)}, 400)
+            return
+
+        if path == "/api/state":
+            with state_lock:
+                payload = dict(state)
+            json_response(self, {"ok": True, "state": payload})
+            return
+
+        if path in ("/", "/dock"):
+            filename = "dock.html"
+        elif path == "/display":
+            filename = "display.html"
+        else:
+            # Serve static files in this folder.
+            filename = path.lstrip("/") or "dock.html"
+
+        target = (ROOT / filename).resolve()
+        if not str(target).startswith(str(ROOT.resolve())) or not target.is_file():
+            self.send_error(404)
+            return
+
+        content_type = {
+            ".html": "text/html; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".js": "application/javascript; charset=utf-8",
+            ".json": "application/json; charset=utf-8",
+        }.get(target.suffix.lower(), "application/octet-stream")
+        data = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/state":
+            self.send_error(404)
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(n)
+            incoming = json.loads(body.decode("utf-8"))
+            with state_lock:
+                if "hymn" in incoming:
+                    state["hymn"] = incoming["hymn"]
+                if "section" in incoming:
+                    state["section"] = incoming["section"]
+                if "stanza" in incoming:
+                    state["stanza"] = incoming["stanza"]
+                if "settings" in incoming:
+                    state["settings"].update(incoming["settings"])
+            json_response(self, {"ok": True, "state": state})
+        except Exception as e:
+            json_response(self, {"ok": False, "error": str(e)}, 400)
+
+
+def main():
+    print("=" * 60)
+    print("Hymn Dock for OBS")
+    print(f"Dock:    http://{HOST}:{PORT}/dock")
+    print(f"Display: http://{HOST}:{PORT}/display")
+    print("Keep this window running while using the dock.")
+    print("Press Ctrl+C to stop.")
+    print("=" * 60)
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopping Hymn Dock...")
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()
